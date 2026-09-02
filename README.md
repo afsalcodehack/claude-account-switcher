@@ -3,6 +3,36 @@
 Quickly switch between Claude accounts (subscriptions) in **Claude Code** inside VS Code,
 with live usage limits for all your accounts at a glance.
 
+## Install
+
+This fork carries fixes that are not in the Marketplace build yet (see the **Unreleased**
+section of [CHANGELOG.md](CHANGELOG.md) — most importantly, the active account's usage panel
+no longer freezes on stale percentages after Claude Code rotates its tokens). Build and
+install it yourself:
+
+```bash
+git clone https://github.com/afsalcodehack/claude-account-switcher.git
+cd claude-account-switcher && npm ci && npm run build:vsix
+code --install-extension claude-code-account-switcher-0.2.5.vsix
+```
+
+Then run **Developer: Reload Window** in every open VS Code window — the extension host keeps
+running the old code until you do.
+
+Notes:
+
+- Needs Node.js 20+ and the `code` command on your PATH (VS Code: *Shell Command: Install
+  'code' command in PATH*).
+- Already have the Marketplace version installed? The `.vsix` replaces it in place; your saved
+  profiles and tokens live in VS Code storage and are untouched.
+- To update one machine without rebuilding, copy `dist/extension.js` from a machine that has
+  built it over `<vscode extensions>/krzysztofzander.claude-code-account-switcher-*/dist/extension.js`
+  and reload the window.
+- **A Marketplace update overwrites this build.** The packaged version number matches upstream,
+  so when a newer release is published VS Code replaces the patched extension and the fixed
+  behaviour is lost. Rebuild from this fork after any extension update. The symptom to watch
+  for is one account's *updated N min ago* no longer advancing while the others keep updating.
+
 ## Why
 
 You have several Claude subscriptions. When one account runs out of usage (the 5-hour or
