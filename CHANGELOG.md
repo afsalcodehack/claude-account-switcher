@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Fixed the active account's usage panel freezing on stale percentages, with the refresh button
+  appearing to do nothing. Once Claude Code rotated that account's tokens in place, the saved
+  profile copy could no longer be matched to `~/.claude/.credentials.json` (both tokens changed,
+  and profiles saved before identities were recorded have no email/org to match on), so polling
+  bailed out with no fetch and no error. An active profile whose stored credentials are unusable
+  now reads the live credentials file directly, for the request only — the tokens are never
+  written back, so a stale active marker can never overwrite a profile's secrets.
+- Every path that gave up on a poll now records a short "Usage is stale: …" reason instead of
+  returning silently, and keeps the previous `fetchedAt` so "updated N min ago" still describes
+  the numbers actually on screen.
+- Labelled per-model weekly caps (`weekly_scoped`) as `Weekly (<model>)` instead of rendering a
+  second, indistinguishable "Weekly" row beside the account-wide total.
+
 ## 0.2.5
 
 - Added browser-based OAuth authorization that works without Claude Code CLI.

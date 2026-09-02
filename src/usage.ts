@@ -13,9 +13,30 @@ const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const USER_AGENT = "claude-code/2.0.14";
 const BACKOFF_429_MS = 300_000; // 5 min after hitting the request rate limit
 
+/**
+ * Shown instead of freezing when polling cannot proceed. None of these may contain a phrase
+ * that requiresProfileReauthorization() or the panel's isAuthProblem() reads as a broken
+ * profile, or the panel would hide the meters behind a spurious "Auth" button.
+ */
+export const STALE_TOKEN_HELD_BY_CLAUDE =
+  "Usage is stale: Claude Code holds this account's token; waiting for it to rotate.";
+export const STALE_ACTIVE_TOKEN_EXPIRED =
+  "Usage is stale: the active account token expired and Claude Code has not written a new one yet.";
+export const STALE_ACTIVE_TOKEN_REJECTED =
+  "Usage is stale: the stored token for this active account was rejected and no newer one is available.";
+
 interface RawWindow {
   utilization?: number;
   resets_at?: string | null;
+}
+interface RawScopeTarget {
+  id?: string | null;
+  display_name?: string | null;
+}
+/** Narrows a limit to one model or surface, e.g. the per-model weekly cap. */
+interface RawLimitScope {
+  model?: RawScopeTarget | null;
+  surface?: RawScopeTarget | null;
 }
 interface RawLimit {
   kind?: string;
@@ -24,6 +45,7 @@ interface RawLimit {
   severity?: string;
   resets_at?: string | null;
   is_active?: boolean;
+  scope?: RawLimitScope | null;
 }
 interface RawUsage {
   five_hour?: RawWindow | null;
@@ -31,7 +53,13 @@ interface RawUsage {
   limits?: RawLimit[];
 }
 
-function labelFor(kind: string, group: string): string {
+function scopeName(scope: RawLimitScope | null | undefined): string | null {
+  const name = scope?.model?.display_name ?? scope?.surface?.display_name;
+  const trimmed = name?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function labelFor(kind: string, group: string, scope?: RawLimitScope | null): string {
   switch (kind) {
     case "session":
       return "Session (5h)";
@@ -41,6 +69,12 @@ function labelFor(kind: string, group: string): string {
       return "Weekly (Opus)";
     case "weekly_sonnet":
       return "Weekly (Sonnet)";
+    case "weekly_scoped": {
+      // A cap on one model or surface. Without the scope name this renders as a
+      // second, indistinguishable "Weekly" row next to the account-wide total.
+      const name = scopeName(scope);
+      return name ? `Weekly (${name})` : "Weekly (scoped)";
+    }
     default:
       if (group === "session") return "Session (5h)";
       if (group === "weekly") return "Weekly";
@@ -57,7 +91,7 @@ export function parseUsage(raw: RawUsage): UsageSnapshot {
       const percent = typeof l.percent === "number" ? l.percent : 0;
       windows.push({
         kind: l.kind ?? l.group ?? "limit",
-        label: labelFor(l.kind ?? "", l.group ?? ""),
+        label: labelFor(l.kind ?? "", l.group ?? "", l.scope),
         percent: Math.max(0, Math.min(100, Math.round(percent))),
         severity: l.severity ?? "normal",
         resetsAt: l.resets_at ?? null,
@@ -214,14 +248,34 @@ export class UsagePoller {
     // Always reconcile the per-profile file before honoring a previous auth error.
     // Claude may have won a refresh race and persisted the valid rotated generation.
     creds = await this.syncProfileConfigCreds(id, creds);
-    let prev = this.store.get(id)?.lastUsage;
-    if (requiresProfileReauthorization(prev?.error) && this.isProfileActive(id)) {
-      await this.syncActiveProfile();
-      creds = (await this.store.getCreds(id)) ?? creds;
-      prev = this.store.get(id)?.lastUsage;
+
+    // Claude Code rotates the active account's tokens in ~/.claude/.credentials.json in place.
+    // Once it does, syncActiveFromFile can no longer recognize the file (both tokens changed,
+    // and a profile saved before identities were recorded has no email/org to match on), so the
+    // stored copy stays on the spent generation. Refreshing it here is forbidden because this
+    // profile is active, which used to leave pollOne with no usable token and no way forward.
+    // The credentials file *is* the active account by this extension's own definition, so read
+    // it directly. Display only: the tokens are deliberately not written back to the profile,
+    // so a stale activeId can mislabel a card but can never overwrite a profile's secrets.
+    let adoptedLiveCreds = false;
+    if (this.isProfileActive(id) && !isUsableUnexpired(creds)) {
+      const liveCreds = this.credentials.readCurrent();
+      if (liveCreds && isUsableUnexpired(liveCreds)) {
+        creds = liveCreds;
+        adoptedLiveCreds = true;
+      }
     }
-    if (requiresProfileReauthorization(prev?.error)) {
-      return;
+
+    let prev = this.store.get(id)?.lastUsage;
+    if (!adoptedLiveCreds) {
+      if (requiresProfileReauthorization(prev?.error) && this.isProfileActive(id)) {
+        await this.syncActiveProfile();
+        creds = (await this.store.getCreds(id)) ?? creds;
+        prev = this.store.get(id)?.lastUsage;
+      }
+      if (requiresProfileReauthorization(prev?.error)) {
+        return;
+      }
     }
 
     // Refresh an expired token (it rotates, so save the new one).
@@ -230,6 +284,7 @@ export class UsagePoller {
         await this.syncActiveProfile();
         const synced = await this.store.getCreds(id);
         if (!synced || TokenRefresher.isExpired(synced)) {
+          await this.markStale(id, prev, STALE_ACTIVE_TOKEN_EXPIRED);
           return;
         }
         creds = synced;
@@ -249,10 +304,12 @@ export class UsagePoller {
       if (this.isProfileActive(id)) {
         await this.syncActiveProfile();
         const synced = await this.store.getCreds(id);
-        if (!synced || !credentialsChanged(creds, synced)) {
+        const replacement = synced && credentialsChanged(creds, synced) ? synced : liveReplacementFor(creds, this.credentials);
+        if (!replacement) {
+          await this.markStale(id, prev, STALE_ACTIVE_TOKEN_REJECTED);
           return;
         }
-        creds = synced;
+        creds = replacement;
         result = await fetchUsage(creds);
       } else {
         const refreshed = await this.refreshCreds(id, creds, true, prev);
@@ -333,6 +390,9 @@ export class UsagePoller {
 
     if (!locked.value?.ok) {
       if (locked.value?.deferred) {
+        // Deliberately not refreshed: Claude Code owns this rotating token. Say so rather
+        // than returning silently, which froze the card with no indication anything failed.
+        await this.markStale(id, prev, STALE_TOKEN_HELD_BY_CLAUDE);
         return null;
       }
       await this.store.updateUsage(id, {
@@ -346,6 +406,25 @@ export class UsagePoller {
     }
 
     return locked.value.creds;
+  }
+
+  /**
+   * Records why usage could not be refreshed without inventing a new reading.
+   * Keeps the previous fetchedAt so "updated N min ago" keeps telling the truth about how
+   * old the numbers on screen actually are.
+   */
+  private async markStale(
+    id: string,
+    prev: UsageSnapshot | undefined,
+    error: string
+  ): Promise<void> {
+    await this.store.updateUsage(id, {
+      fetchedAt: prev?.fetchedAt ?? Date.now(),
+      windows: prev?.windows ?? [],
+      sessionPercent: prev?.sessionPercent ?? null,
+      weeklyPercent: prev?.weeklyPercent ?? null,
+      error,
+    });
   }
 
   private async syncProfileConfigCreds(
@@ -374,6 +453,26 @@ export class UsagePoller {
       await this.coordination.syncCurrentProfile();
     }
   }
+}
+
+/** Complete enough to authenticate with, and not past its expiry. */
+function isUsableUnexpired(creds: OAuthCreds): boolean {
+  return hasUsableOAuthCreds(creds) && !TokenRefresher.isExpired(creds);
+}
+
+/**
+ * The live credentials file, but only when it holds a different, usable token than the one
+ * that was just rejected. Lets an active profile recover from a rotation mid-poll.
+ */
+function liveReplacementFor(
+  rejected: OAuthCreds,
+  credentials: CredentialsManager
+): OAuthCreds | null {
+  const liveCreds = credentials.readCurrent();
+  if (!liveCreds || !isUsableUnexpired(liveCreds) || !credentialsChanged(rejected, liveCreds)) {
+    return null;
+  }
+  return liveCreds;
 }
 
 function shouldPreferProfileFileCreds(fileCreds: OAuthCreds, stored: OAuthCreds): boolean {

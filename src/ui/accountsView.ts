@@ -159,7 +159,8 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-function isAuthProblem(error: string | undefined): boolean {
+/** True when an error means the profile itself is broken, not merely that a poll failed. */
+export function isAuthProblem(error: string | undefined): boolean {
   if (requiresProfileReauthorization(error)) {
     return true;
   }

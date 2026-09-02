@@ -2,6 +2,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { parseUsage } from "../src/usage";
+import * as usageModule from "../src/usage";
+import { isAuthProblem } from "../src/ui/accountsView";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
@@ -37,6 +39,53 @@ check("fallback weeklyPercent = 90", fb.weeklyPercent === 90);
 
 const em = parseUsage({} as never);
 check("empty -> 0 windows, null percents", em.windows.length === 0 && em.sessionPercent === null);
+
+// A per-model cap arrives as kind "weekly_scoped" alongside the account-wide weekly total.
+// Without the scope name both rows render as "Weekly" and look like duplicates.
+const scoped = parseUsage({
+  limits: [
+    { kind: "session", group: "session", percent: 82, resets_at: null },
+    { kind: "weekly_all", group: "weekly", percent: 48, resets_at: null },
+    {
+      kind: "weekly_scoped",
+      group: "weekly",
+      percent: 76,
+      resets_at: null,
+      scope: { model: { id: null, display_name: "Fable" }, surface: null },
+    },
+  ],
+} as never);
+check("scoped weekly limit is named after its model", scoped.windows[2].label === "Weekly (Fable)");
+check("scoped weekly limit keeps its own percent", scoped.windows[2].percent === 76);
+check("weeklyPercent still tracks the account-wide total", scoped.weeklyPercent === 48);
+
+const unnamedScope = parseUsage({
+  limits: [{ kind: "weekly_scoped", group: "weekly", percent: 5, resets_at: null, scope: null }],
+} as never);
+check("unnamed scope falls back to a distinct label", unnamedScope.windows[0].label === "Weekly (scoped)");
+
+const futureKind = parseUsage({
+  limits: [{ kind: "monthly_all", group: "monthly", percent: 7, resets_at: null }],
+} as never);
+check("unknown future kinds still render", futureKind.windows[0].label === "monthly_all");
+
+console.log("Stale usage markers:");
+// The panel replaces an error with "Needs reauthorization" (and hides the meters behind an
+// Auth button) whenever isAuthProblem matches. A "usage is stale" note must never match.
+const staleMessages = [
+  usageModule.STALE_TOKEN_HELD_BY_CLAUDE,
+  usageModule.STALE_ACTIVE_TOKEN_EXPIRED,
+  usageModule.STALE_ACTIVE_TOKEN_REJECTED,
+];
+check(
+  "stale markers do not read as broken profiles",
+  staleMessages.every((m) => !isAuthProblem(m) && !requiresProfileReauthorization(m))
+);
+check(
+  "genuine auth failures still read as broken profiles",
+  isAuthProblem("Failed to refresh token: HTTP 400 invalid_grant") &&
+    isAuthProblem("HTTP 401: unauthorized")
+);
 
 console.log("CredentialsManager (temp file):");
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-test-"));
@@ -258,7 +307,7 @@ async function runAccountStoreTests(): Promise<void> {
 
 async function runUsagePollerTests(): Promise<void> {
   console.log("UsagePoller:");
-  const { UsagePoller } = await import("../src/usage");
+  const { UsagePoller, STALE_ACTIVE_TOKEN_EXPIRED } = await import("../src/usage");
   const store = createStore();
   const profile = await store.addFromCreds("Good", {
     accessToken: "stored-access",
@@ -450,8 +499,140 @@ async function runUsagePollerTests(): Promise<void> {
     );
     await activePoller.pollOne(activeProfile.id, true);
     check("never refreshes a token owned by an active Claude window", fetchCalls === 0);
+
+    const staleSnapshot = activeStore.get(activeProfile.id)?.lastUsage;
+    check(
+      "an active profile it cannot poll reports staleness instead of freezing",
+      staleSnapshot?.error === STALE_ACTIVE_TOKEN_EXPIRED
+    );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+
+  await runRotatedActiveTokenTests();
+}
+
+/**
+ * Regression: Claude Code rotates the active account's tokens in place, so the profile's saved
+ * copy goes stale and cannot be re-matched to the credentials file. The poller used to give up
+ * silently, freezing the card on old percentages while the refresh button appeared to do nothing.
+ */
+async function runRotatedActiveTokenTests(): Promise<void> {
+  const { UsagePoller, STALE_TOKEN_HELD_BY_CLAUDE } = await import("../src/usage");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-rotated-test-"));
+  const credPath = path.join(tmpDir, ".credentials.json");
+  const previousCredPath = process.env.TEST_CRED_PATH;
+  process.env.TEST_CRED_PATH = credPath;
+
+  const originalFetch = globalThis.fetch;
+  const bearers: string[] = [];
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+    bearers.push(auth.replace("Bearer ", ""));
+    return new Response(
+      JSON.stringify({
+        limits: [
+          { kind: "session", group: "session", percent: 82, resets_at: null },
+          { kind: "weekly_all", group: "weekly", percent: 48, resets_at: null },
+        ],
+      }),
+      { status: 200 }
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    const store = createStore();
+    // What the extension saved before Claude Code rotated the tokens underneath it.
+    const profile = await store.addFromCreds("Rotated", {
+      accessToken: "spent-access",
+      refreshToken: "must-not-be-spent",
+      expiresAt: Date.now() - 3_600_000,
+      scopes: ["user:profile"],
+    });
+    await store.updateUsage(profile.id, {
+      fetchedAt: Date.now() - 107 * 60_000,
+      windows: [],
+      sessionPercent: 53,
+      weeklyPercent: 30,
+    });
+    // What Claude Code actually wrote to ~/.claude/.credentials.json.
+    new CredentialsManager().writeCreds({
+      accessToken: "rotated-access",
+      refreshToken: "rotated-refresh",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ["user:profile"],
+    } as never);
+
+    const poller = new UsagePoller(
+      store,
+      new TokenRefresher(),
+      new CredentialsManager(),
+      () => 240,
+      () => undefined,
+      { isProfileActive: () => true }
+    );
+    await poller.pollOne(profile.id, true);
+
+    const usage = store.get(profile.id)?.lastUsage;
+    check("rotated active account is polled with the live token", bearers[0] === "rotated-access");
+    check("rotated active account reports fresh usage", usage?.sessionPercent === 82);
+    check("successful poll clears the stale marker", usage?.error === undefined);
+    check(
+      "reading the live file never overwrites the profile's saved secrets",
+      (await store.getCreds(profile.id))?.refreshToken === "must-not-be-spent"
+    );
+
+    // A deferred refresh (Claude Code owns the rotating token) must say so, and must not
+    // pretend the numbers on screen were just re-fetched.
+    const deferredStore = createStore();
+    const deferredProfile = await deferredStore.addFromCreds("Deferred", {
+      accessToken: "spent-access",
+      refreshToken: "must-not-be-spent",
+      expiresAt: Date.now() - 3_600_000,
+      scopes: ["user:profile"],
+    });
+    const originalFetchedAt = Date.now() - 42 * 60_000;
+    await deferredStore.updateUsage(deferredProfile.id, {
+      fetchedAt: originalFetchedAt,
+      windows: [],
+      sessionPercent: 53,
+      weeklyPercent: 30,
+    });
+    const deferredPoller = new UsagePoller(
+      deferredStore,
+      new TokenRefresher(),
+      new CredentialsManager(),
+      () => 240,
+      () => undefined,
+      { isProfileActive: () => true }
+    );
+    const refreshed = await (
+      deferredPoller as never as {
+        refreshCreds(
+          id: string,
+          creds: unknown,
+          force: boolean,
+          prev: unknown
+        ): Promise<unknown>;
+      }
+    ).refreshCreds(
+      deferredProfile.id,
+      await deferredStore.getCreds(deferredProfile.id),
+      false,
+      deferredStore.get(deferredProfile.id)?.lastUsage
+    );
+    const deferredUsage = deferredStore.get(deferredProfile.id)?.lastUsage;
+    check("deferred refresh still refuses to spend the token", refreshed === null);
+    check("deferred refresh is reported", deferredUsage?.error === STALE_TOKEN_HELD_BY_CLAUDE);
+    check(
+      "a stale marker keeps the original fetch time",
+      deferredUsage?.fetchedAt === originalFetchedAt
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousCredPath === undefined) delete process.env.TEST_CRED_PATH;
+    else process.env.TEST_CRED_PATH = previousCredPath;
   }
 }
 
